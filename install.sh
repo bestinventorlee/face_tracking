@@ -69,8 +69,38 @@ fi
 # 의존성 설치
 echo ""
 echo -e "${YELLOW}[2/4] Python 의존성 설치 중...${NC}"
+
+# PEP 668 오류 대응: 가상환경 사용 여부 확인
+if [ -d "$HOME/face_tracking_venv" ]; then
+    echo "기존 가상환경을 사용합니다."
+    source "$HOME/face_tracking_venv/bin/activate"
+    USE_VENV=true
+else
+    echo "가상환경을 생성하시겠습니까? (y/n) - 권장"
+    read -p "답변: " CREATE_VENV
+    if [ "$CREATE_VENV" = "y" ] || [ "$CREATE_VENV" = "Y" ]; then
+        echo "가상환경 생성 중..."
+        python3 -m venv "$HOME/face_tracking_venv"
+        source "$HOME/face_tracking_venv/bin/activate"
+        pip install --upgrade pip
+        USE_VENV=true
+        echo -e "${GREEN}✓ 가상환경 생성 완료${NC}"
+    else
+        USE_VENV=false
+    fi
+fi
+
 if [ -f "$SCRIPT_DIR/requirements_face_tracking.txt" ]; then
-    pip install -r "$SCRIPT_DIR/requirements_face_tracking.txt"
+    if [ "$USE_VENV" = true ]; then
+        pip install -r "$SCRIPT_DIR/requirements_face_tracking.txt"
+    else
+        # 시스템 패키지로 설치 시도
+        echo "시스템 패키지로 설치를 시도합니다..."
+        pip3 install --break-system-packages --user -r "$SCRIPT_DIR/requirements_face_tracking.txt" || {
+            echo "⚠️ pip 설치 실패. apt로 설치를 시도합니다..."
+            sudo apt install -y python3-opencv python3-numpy python3-scipy python3-rclpy
+        }
+    fi
     echo -e "${GREEN}✓ 의존성 설치 완료${NC}"
 else
     echo "⚠️ requirements_face_tracking.txt를 찾을 수 없습니다."

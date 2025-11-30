@@ -10,7 +10,7 @@ from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
-    # 현재 디렉토리에서 노드 실행
+    # 패키지에서 노드 실행
     node = Node(
         package='face_tracking',
         executable='face_tracking_node.py',
