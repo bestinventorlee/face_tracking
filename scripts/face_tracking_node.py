@@ -256,10 +256,27 @@ class FaceTrackingNode(Node):
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
         # 현재 엔드이펙트 위치 및 각도 (mm, degree)
-        self.current_position = np.array([0.0, 0.0, 0.0])  # x, y, z (mm)
-        self.current_orientation = np.array([0.0, 0.0, 0.0])  # roll, pitch, yaw (degree)
-        self.current_angles = np.zeros(6)  # 서보 각도 (degree)
-        self.has_position = False
+        # 초기 위치를 홈 포지션(모든 서보 0도)으로 가정
+        # 실제 servo_status를 받으면 업데이트됨
+        self.current_angles = np.zeros(6)  # 서보 각도 (degree) - 홈 포지션 가정
+        try:
+            # Forward Kinematics로 홈 포지션의 실제 위치 계산
+            position_m, orientation_rad = self.kinematics.forward_kinematics(self.current_angles)
+            self.current_position = position_m * 1000.0  # 미터를 밀리미터로 변환
+            self.current_orientation = np.rad2deg(orientation_rad)  # 라디안을 도로 변환
+            self.has_position = True  # 초기 위치 가정
+            self.get_logger().info(
+                f'초기 위치를 홈 포지션으로 가정: ({self.current_position[0]:.1f}, '
+                f'{self.current_position[1]:.1f}, {self.current_position[2]:.1f}) mm'
+            )
+            self.get_logger().info(
+                '실제 서보 상태(servo_status)를 받으면 위치가 업데이트됩니다.'
+            )
+        except Exception as e:
+            self.get_logger().warn(f'초기 위치 계산 실패: {e}, 기본값 사용')
+            self.current_position = np.array([0.0, 0.0, 500.0])  # 기본 Z 높이
+            self.current_orientation = np.array([0.0, 0.0, 0.0])
+            self.has_position = True  # 기본 위치라도 True로 설정하여 트래킹 시작 가능
         
         # 얼굴 추적 변수
         self.face_center = None  # 화면상 얼굴 중심 좌표 (x, y)
@@ -314,16 +331,15 @@ class FaceTrackingNode(Node):
         
         # 초기 상태 요청 (시작 시) - 선택적 기능
         # 주의: request_servo_status가 실패해도 servo_status 토픽을 구독하므로 작동 가능
+        # 초기 위치는 홈 포지션(0도)으로 가정되어 있으므로, 실제 서보 상태를 받으면 업데이트됨
         if self.request_initial_status:
             time.sleep(0.5)  # ROS2 초기화 대기
             self.request_servo_status()  # 실패해도 경고만 출력하고 계속 진행
             self.request_initial_status = False
-            if not self.has_position:
-                self.get_logger().warn(
-                    '초기 서보 상태를 받지 못했습니다. '
-                    'servo_status 토픽을 기다리는 중... '
-                    '(서보가 움직이거나 상태를 보내면 자동으로 업데이트됩니다)'
-                )
+            self.get_logger().info(
+                '초기 위치는 홈 포지션으로 가정되었습니다. '
+                '실제 서보 상태(servo_status)를 받으면 위치가 업데이트됩니다.'
+            )
         
     def request_servo_status(self):
         """서보 상태 요청 (마스터가 지원하는 경우, data=0: 모든 서보 요청)"""
@@ -358,9 +374,12 @@ class FaceTrackingNode(Node):
                     
                     self.has_position = True
                     
-                    self.get_logger().debug(
-                        f'현재 위치 업데이트: ({self.current_position[0]:.1f}, '
-                        f'{self.current_position[1]:.1f}, {self.current_position[2]:.1f}) mm'
+                    self.get_logger().info(
+                        f'서보 상태 수신: 현재 위치 업데이트 ({self.current_position[0]:.1f}, '
+                        f'{self.current_position[1]:.1f}, {self.current_position[2]:.1f}) mm, '
+                        f'각도: [{self.current_angles[0]:.1f}, {self.current_angles[1]:.1f}, '
+                        f'{self.current_angles[2]:.1f}, {self.current_angles[3]:.1f}, '
+                        f'{self.current_angles[4]:.1f}, {self.current_angles[5]:.1f}] deg'
                     )
                 except Exception as fk_error:
                     self.get_logger().warn(f'FK 계산 오류: {fk_error}')
@@ -604,7 +623,14 @@ class FaceTrackingNode(Node):
                         else:
                             self.get_logger().warn('IK 계산 실패: 목표 위치에 도달할 수 없습니다.')
                     else:
-                        self.get_logger().warn('현재 로봇 위치를 알 수 없어 명령을 전송할 수 없습니다.')
+                        # has_position이 False인 경우는 거의 없지만, 안전장치
+                        self.get_logger().warn(
+                            '현재 로봇 위치를 알 수 없습니다. '
+                            '서보 상태(servo_status)를 기다리는 중... '
+                            '(로봇을 조금 움직이면 자동으로 위치를 파악합니다)'
+                        )
+                        # 서보 상태 요청 (선택적)
+                        self.request_servo_status()
             
             self.previous_face_center = self.face_center.copy()
             
