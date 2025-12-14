@@ -7,7 +7,7 @@
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, Empty
+from std_msgs.msg import Float32MultiArray, Int32
 import cv2
 import numpy as np
 from typing import Optional, Tuple
@@ -189,10 +189,9 @@ class FaceTrackingNode(Node):
         )
         
         # 서보 상태 요청 퍼블리셔 (선택적 - 마스터가 지원하는 경우)
-        # Empty 메시지로 모든 서보 상태 요청
-        from std_msgs.msg import Empty
+        # Int32 메시지로 모든 서보 상태 요청 (data=0: 모든 서보, data=1~6: 특정 서보)
         self.request_status_pub = self.create_publisher(
-            Empty,
+            Int32,
             'request_servo_status',
             10
         )
@@ -320,11 +319,12 @@ class FaceTrackingNode(Node):
             self.request_initial_status = False
         
     def request_servo_status(self):
-        """서보 상태 요청 (마스터가 지원하는 경우)"""
+        """서보 상태 요청 (마스터가 지원하는 경우, data=0: 모든 서보 요청)"""
         if self.request_status_pub is not None:
-            msg = Empty()
+            msg = Int32()
+            msg.data = 0  # 0 = 모든 서보 요청
             self.request_status_pub.publish(msg)
-            self.get_logger().debug('서보 상태 요청 전송')
+            self.get_logger().debug('서보 상태 요청 전송 (모든 서보)')
     
     def servo_status_callback(self, msg):
         """서보 상태 메시지 수신 콜백"""
