@@ -312,11 +312,18 @@ class FaceTrackingNode(Node):
         self.get_logger().info(f'최대 이동 거리: {self.max_movement} mm')
         self.get_logger().info(f'트래킹 민감도: {self.tracking_sensitivity}')
         
-        # 초기 상태 요청 (시작 시)
+        # 초기 상태 요청 (시작 시) - 선택적 기능
+        # 주의: request_servo_status가 실패해도 servo_status 토픽을 구독하므로 작동 가능
         if self.request_initial_status:
             time.sleep(0.5)  # ROS2 초기화 대기
-            self.request_servo_status()
+            self.request_servo_status()  # 실패해도 경고만 출력하고 계속 진행
             self.request_initial_status = False
+            if not self.has_position:
+                self.get_logger().warn(
+                    '초기 서보 상태를 받지 못했습니다. '
+                    'servo_status 토픽을 기다리는 중... '
+                    '(서보가 움직이거나 상태를 보내면 자동으로 업데이트됩니다)'
+                )
         
     def request_servo_status(self):
         """서보 상태 요청 (마스터가 지원하는 경우, data=0: 모든 서보 요청)"""
@@ -568,11 +575,15 @@ class FaceTrackingNode(Node):
                     (self.frame_width, int(self.screen_center[1])),
                     (255, 0, 0), 1)
             
-            # 얼굴이 처음 검출되었을 때 현재 위치 요청
+            # 얼굴이 처음 검출되었을 때 현재 위치 요청 (선택적)
             if self.previous_face_center is None:
                 # 얼굴이 처음 검출되면 현재 서보 상태를 요청
-                self.request_servo_status()
-                self.get_logger().info('얼굴 검출됨: 서보 상태 요청 전송')
+                # 주의: request_servo_status가 실패해도 servo_status 토픽을 구독하므로 작동 가능
+                if not self.has_position:
+                    self.request_servo_status()
+                    self.get_logger().info('얼굴 검출됨: 서보 상태 요청 전송 (현재 위치 없음)')
+                else:
+                    self.get_logger().info('얼굴 검출됨: 현재 위치 있음, 트래킹 시작')
             
             # 얼굴이 이전 프레임에서 이동했는지 확인
             if self.previous_face_center is not None:
