@@ -166,8 +166,16 @@ class FaceTrackingNode(Node):
         self.kinematics = CobotKinematics()
         
         # ROS2 퍼블리셔 생성 (로봇 제어 명령 전송)
-        # IK를 직접 계산하여 각도로 전송하므로 servo_angles_with_speed 사용
+        # servo_angles: 속도/가속도 없이 즉시 이동 (트래킹에 적합)
+        # servo_angles_with_speed: 속도/가속도 포함 (부드러운 이동)
         self.angle_pub = self.create_publisher(
+            Float32MultiArray,
+            'servo_angles',  # 속도/가속도 없이 즉시 이동
+            10
+        )
+        
+        # 선택적: 부드러운 이동이 필요한 경우 사용
+        self.angle_speed_pub = self.create_publisher(
             Float32MultiArray,
             'servo_angles_with_speed',
             10
@@ -256,27 +264,16 @@ class FaceTrackingNode(Node):
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
         # 현재 엔드이펙트 위치 및 각도 (mm, degree)
-        # 초기 위치를 홈 포지션(모든 서보 0도)으로 가정
-        # 실제 servo_status를 받으면 업데이트됨
-        self.current_angles = np.zeros(6)  # 서보 각도 (degree) - 홈 포지션 가정
-        try:
-            # Forward Kinematics로 홈 포지션의 실제 위치 계산
-            position_m, orientation_rad = self.kinematics.forward_kinematics(self.current_angles)
-            self.current_position = position_m * 1000.0  # 미터를 밀리미터로 변환
-            self.current_orientation = np.rad2deg(orientation_rad)  # 라디안을 도로 변환
-            self.has_position = True  # 초기 위치 가정
-            self.get_logger().info(
-                f'초기 위치를 홈 포지션으로 가정: ({self.current_position[0]:.1f}, '
-                f'{self.current_position[1]:.1f}, {self.current_position[2]:.1f}) mm'
-            )
-            self.get_logger().info(
-                '실제 서보 상태(servo_status)를 받으면 위치가 업데이트됩니다.'
-            )
-        except Exception as e:
-            self.get_logger().warn(f'초기 위치 계산 실패: {e}, 기본값 사용')
-            self.current_position = np.array([0.0, 0.0, 500.0])  # 기본 Z 높이
-            self.current_orientation = np.array([0.0, 0.0, 0.0])
-            self.has_position = True  # 기본 위치라도 True로 설정하여 트래킹 시작 가능
+        # servo_status 토픽이 실패할 수 있으므로 안전한 초기화 전략 사용
+        self.current_position = np.array([0.0, 0.0, 0.0])  # x, y, z (mm)
+        self.current_orientation = np.array([0.0, 0.0, 0.0])  # roll, pitch, yaw (degree)
+        self.current_angles = np.zeros(6)  # 서보 각도 (degree)
+        self.has_position = False  # 실제 위치를 받을 때까지 False
+        
+        # 초기 위치 요청 타임아웃 (초) - 파라미터로 설정됨
+        self.start_time = time.time()
+        self.position_request_sent = False
+        self.first_command_sent = False  # 첫 번째 명령 전송 여부
         
         # 얼굴 추적 변수
         self.face_center = None  # 화면상 얼굴 중심 좌표 (x, y)
@@ -293,6 +290,8 @@ class FaceTrackingNode(Node):
         self.declare_parameter('camera_fov_vertical', 45.0)
         self.declare_parameter('estimated_face_distance', 1000.0)
         self.declare_parameter('movement_threshold', 5.0)  # 픽셀 단위
+        self.declare_parameter('position_timeout', 5.0)  # 초기 위치 요청 타임아웃 (초)
+        self.declare_parameter('safe_first_movement_limit', 10.0)  # 첫 번째 명령 최대 이동 거리 (mm)
         
         self.tracking_speed = self.get_parameter('tracking_speed').get_parameter_value().double_value
         self.tracking_accel = self.get_parameter('tracking_accel').get_parameter_value().double_value
@@ -302,6 +301,8 @@ class FaceTrackingNode(Node):
         self.camera_fov_vertical = self.get_parameter('camera_fov_vertical').get_parameter_value().double_value
         self.estimated_face_distance = self.get_parameter('estimated_face_distance').get_parameter_value().double_value
         self.movement_threshold = self.get_parameter('movement_threshold').get_parameter_value().double_value
+        self.position_timeout = self.get_parameter('position_timeout').get_parameter_value().double_value
+        self.safe_first_movement_limit = self.get_parameter('safe_first_movement_limit').get_parameter_value().double_value
         
         # 화면 중심 좌표 (카메라 해상도에 따라 동적으로 설정)
         ret, test_frame = self.cap.read()
@@ -331,14 +332,14 @@ class FaceTrackingNode(Node):
         
         # 초기 상태 요청 (시작 시) - 선택적 기능
         # 주의: request_servo_status가 실패해도 servo_status 토픽을 구독하므로 작동 가능
-        # 초기 위치는 홈 포지션(0도)으로 가정되어 있으므로, 실제 서보 상태를 받으면 업데이트됨
         if self.request_initial_status:
             time.sleep(0.5)  # ROS2 초기화 대기
             self.request_servo_status()  # 실패해도 경고만 출력하고 계속 진행
             self.request_initial_status = False
+            self.position_request_sent = True
             self.get_logger().info(
-                '초기 위치는 홈 포지션으로 가정되었습니다. '
-                '실제 서보 상태(servo_status)를 받으면 위치가 업데이트됩니다.'
+                '초기 서보 상태 요청 전송. '
+                f'{self.position_timeout}초 내에 응답이 없으면 안전한 위치로 가정합니다.'
             )
         
     def request_servo_status(self):
@@ -540,8 +541,9 @@ class FaceTrackingNode(Node):
             self.get_logger().warn('IK 계산 실패로 명령을 전송하지 않습니다.')
             return
         
+        # servo_angles 토픽 사용: 속도/가속도 없이 즉시 이동 (트래킹에 적합)
         msg = Float32MultiArray()
-        # servo_angles_with_speed 형식: [angle1~6, speed, accel] (8개)
+        # servo_angles 형식: [angle1~6] (6개만)
         msg.data = [
             float(target_angles[0]),  # 서보 1 각도 (degree)
             float(target_angles[1]),  # 서보 2 각도 (degree)
@@ -549,19 +551,42 @@ class FaceTrackingNode(Node):
             float(target_angles[3]),  # 서보 4 각도 (degree)
             float(target_angles[4]),  # 서보 5 각도 (degree)
             float(target_angles[5]),  # 서보 6 각도 (degree)
-            self.tracking_speed,      # speed (deg/s)
-            self.tracking_accel       # accel (deg/s²)
         ]
         
         self.angle_pub.publish(msg)
         self.get_logger().debug(
-            f'로봇 명령 전송 (각도): [{target_angles[0]:.1f}, {target_angles[1]:.1f}, '
+            f'로봇 명령 전송 (즉시 이동): [{target_angles[0]:.1f}, {target_angles[1]:.1f}, '
             f'{target_angles[2]:.1f}, {target_angles[3]:.1f}, {target_angles[4]:.1f}, '
-            f'{target_angles[5]:.1f}]°, 속도={self.tracking_speed} deg/s'
+            f'{target_angles[5]:.1f}]°'
         )
     
     def process_frame(self):
         """카메라 프레임 처리 및 얼굴 트래킹"""
+        # 초기 위치 타임아웃 체크 (servo_status 토픽이 실패한 경우 대비)
+        if not self.has_position and self.position_request_sent:
+            elapsed_time = time.time() - self.start_time
+            if elapsed_time > self.position_timeout:
+                # 타임아웃: 안전한 중립 위치로 가정 (홈 포지션)
+                # 주의: 실제 위치와 다를 수 있으므로 첫 번째 명령은 작은 이동만 수행
+                try:
+                    # 안전한 중립 위치: 모든 서보 0도 (홈 포지션)
+                    # 하지만 첫 번째 명령은 상대적 이동만 수행하도록 제한
+                    position_m, orientation_rad = self.kinematics.forward_kinematics(self.current_angles)
+                    self.current_position = position_m * 1000.0
+                    self.current_orientation = np.rad2deg(orientation_rad)
+                    self.has_position = True
+                    self.get_logger().warn(
+                        f'⚠️ 서보 상태 수신 타임아웃 ({self.position_timeout}초). '
+                        f'안전한 위치로 가정: ({self.current_position[0]:.1f}, '
+                        f'{self.current_position[1]:.1f}, {self.current_position[2]:.1f}) mm'
+                    )
+                    self.get_logger().warn(
+                        f'⚠️ 실제 위치와 다를 수 있으므로 첫 번째 명령은 '
+                        f'{self.safe_first_movement_limit}mm 이하로만 이동합니다.'
+                    )
+                except Exception as e:
+                    self.get_logger().error(f'초기 위치 계산 실패: {e}')
+        
         ret, frame = self.cap.read()
         if not ret:
             self.get_logger().warn('프레임을 읽을 수 없습니다.')
@@ -614,21 +639,46 @@ class FaceTrackingNode(Node):
                         # 1. 얼굴 이동량을 기반으로 목표 위치 계산
                         target_pos, target_orient = self.calculate_target_position(self.face_center)
                         
-                        # 2. 목표 위치를 IK로 풀어서 각도로 변환
+                        # 2. 첫 번째 명령인 경우 이동 거리 제한 (안전)
+                        if not self.first_command_sent:
+                            # 현재 위치에서 목표 위치까지의 거리 계산
+                            movement_distance = np.linalg.norm(target_pos - self.current_position)
+                            if movement_distance > self.safe_first_movement_limit:
+                                # 이동 거리가 너무 크면 제한
+                                direction = (target_pos - self.current_position) / movement_distance
+                                target_pos = self.current_position + direction * self.safe_first_movement_limit
+                                self.get_logger().warn(
+                                    f'첫 번째 명령: 이동 거리를 {self.safe_first_movement_limit}mm로 제한 '
+                                    f'(원래: {movement_distance:.1f}mm)'
+                                )
+                        
+                        # 3. 목표 위치를 IK로 풀어서 각도로 변환
                         target_angles, ik_success = self.calculate_target_angles(target_pos, target_orient)
                         
-                        # 3. 각도 명령 전송
+                        # 4. 각도 명령 전송
                         if ik_success:
                             self.send_robot_command(target_angles, ik_success)
+                            if not self.first_command_sent:
+                                self.first_command_sent = True
+                                self.get_logger().info(
+                                    '✅ 첫 번째 명령 전송 완료. 이후 명령은 제한 없이 수행됩니다.'
+                                )
                         else:
                             self.get_logger().warn('IK 계산 실패: 목표 위치에 도달할 수 없습니다.')
                     else:
-                        # has_position이 False인 경우는 거의 없지만, 안전장치
-                        self.get_logger().warn(
-                            '현재 로봇 위치를 알 수 없습니다. '
-                            '서보 상태(servo_status)를 기다리는 중... '
-                            '(로봇을 조금 움직이면 자동으로 위치를 파악합니다)'
-                        )
+                        # has_position이 False인 경우: 타임아웃 대기 중
+                        elapsed_time = time.time() - self.start_time
+                        if elapsed_time < self.position_timeout:
+                            self.get_logger().debug(
+                                f'서보 상태 대기 중... ({elapsed_time:.1f}/{self.position_timeout}초)'
+                            )
+                        else:
+                            # 타임아웃 후에도 위치를 모르는 경우 (이론적으로는 발생하지 않아야 함)
+                            self.get_logger().warn(
+                                '현재 로봇 위치를 알 수 없습니다. '
+                                '서보 상태(servo_status)를 기다리는 중... '
+                                '(로봇을 조금 움직이면 자동으로 위치를 파악합니다)'
+                            )
                         # 서보 상태 요청 (선택적)
                         self.request_servo_status()
             
