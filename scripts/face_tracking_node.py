@@ -202,51 +202,33 @@ class FaceTrackingNode(Node):
         self.last_status_request_time = 0.0
         self.status_request_interval = 1.0  # 1초마다 요청 (선택적)
         
+        # 트래킹 파라미터 (ROS2 파라미터에서 로드) - 카메라 인덱스를 먼저 읽기 위해
+        self.declare_parameter('camera_index', 0)  # 카메라 인덱스 (0 또는 1)
+        self.camera_index = self.get_parameter('camera_index').get_parameter_value().integer_value
+        
         # 얼굴 인식기 초기화
-        # cv2.data가 없는 경우를 대비한 fallback 처리
-        import os
-        cascade_path = None
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
         
-        try:
-            if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
-                cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        # 카메라 초기화
+        self.cap = cv2.VideoCapture(self.camera_index)
+        if not self.cap.isOpened():
+            self.get_logger().error(f'카메라 {self.camera_index}를 열 수 없습니다!')
+            # 다른 카메라 시도 (0과 1 중 선택되지 않은 것)
+            fallback_index = 1 if self.camera_index == 0 else 0
+            self.get_logger().info(f'카메라 {fallback_index}로 재시도 중...')
+            self.cap = cv2.VideoCapture(fallback_index)
+            if not self.cap.isOpened():
+                self.get_logger().error('모든 카메라를 열 수 없습니다!')
+                raise RuntimeError('카메라 초기화 실패')
             else:
-                # cv2.data가 없는 경우 직접 경로 찾기
-                # OpenCV 설치 경로에서 찾기
-                possible_paths = [
-                    '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
-                    '/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
-                    '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
-                    '/usr/local/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
-                ]
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        cascade_path = path
-                        break
-                
-                if cascade_path is None:
-                    # Python 패키지 경로에서 찾기
-                    try:
-                        # opencv-python-headless나 opencv-contrib-python의 경우
-                        cv2_path = os.path.dirname(cv2.__file__)
-                        cascade_path = os.path.join(cv2_path, 'data', 'haarcascade_frontalface_default.xml')
-                        if not os.path.exists(cascade_path):
-                            raise FileNotFoundError
-                    except:
-                        raise RuntimeError(
-                            'Haar Cascade 파일을 찾을 수 없습니다. '
-                            '다음 명령으로 설치하세요: '
-                            'sudo apt install opencv-data'
-                        )
-            
-            self.face_cascade = cv2.CascadeClassifier(cascade_path)
-            self.get_logger().info(f'얼굴 인식기 초기화 완료: {cascade_path}')
-        except Exception as e:
-            self.get_logger().error(f'얼굴 인식기 초기화 실패: {e}')
-            raise RuntimeError(f'얼굴 인식기 초기화 실패: {e}')
+                self.camera_index = fallback_index
+                self.get_logger().warn(f'카메라 {fallback_index}를 사용합니다.')
         
-        # 카메라 초기화는 파라미터 로드 후에 수행됨 (아래에서 처리)
-        self.cap = None  # 임시 초기화
+        # 카메라 해상도 설정 (HD 해상도)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
         # 현재 엔드이펙트 위치 및 각도 (mm, degree)
         self.current_position = np.array([0.0, 0.0, 0.0])  # x, y, z (mm)
@@ -269,7 +251,6 @@ class FaceTrackingNode(Node):
         self.declare_parameter('camera_fov_vertical', 45.0)
         self.declare_parameter('estimated_face_distance', 1000.0)
         self.declare_parameter('movement_threshold', 5.0)  # 픽셀 단위
-        self.declare_parameter('camera_index', 0)  # 카메라 인덱스 (0 또는 1)
         
         self.tracking_speed = self.get_parameter('tracking_speed').get_parameter_value().double_value
         self.tracking_accel = self.get_parameter('tracking_accel').get_parameter_value().double_value
@@ -279,30 +260,6 @@ class FaceTrackingNode(Node):
         self.camera_fov_vertical = self.get_parameter('camera_fov_vertical').get_parameter_value().double_value
         self.estimated_face_distance = self.get_parameter('estimated_face_distance').get_parameter_value().double_value
         self.movement_threshold = self.get_parameter('movement_threshold').get_parameter_value().double_value
-        self.camera_index = self.get_parameter('camera_index').get_parameter_value().integer_value
-        
-        # 카메라 재초기화 (파라미터에서 읽은 인덱스 사용)
-        if self.cap is not None and self.cap.isOpened():
-            self.cap.release()
-        
-        # 카메라 초기화 (파라미터에서 지정한 인덱스 사용)
-        self.cap = cv2.VideoCapture(self.camera_index)
-        if not self.cap.isOpened():
-            self.get_logger().error(f'카메라 {self.camera_index}를 열 수 없습니다!')
-            # 다른 카메라 시도 (0과 1 중 선택되지 않은 것)
-            fallback_index = 1 if self.camera_index == 0 else 0
-            self.get_logger().info(f'카메라 {fallback_index}로 재시도 중...')
-            self.cap = cv2.VideoCapture(fallback_index)
-            if not self.cap.isOpened():
-                self.get_logger().error('모든 카메라를 열 수 없습니다!')
-                raise RuntimeError('카메라 초기화 실패')
-            else:
-                self.camera_index = fallback_index
-                self.get_logger().warn(f'카메라 {fallback_index}를 사용합니다.')
-        
-        # 카메라 해상도 설정 (HD 해상도)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
         # 화면 중심 좌표 (카메라 해상도에 따라 동적으로 설정)
         ret, test_frame = self.cap.read()
