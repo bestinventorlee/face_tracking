@@ -207,35 +207,24 @@ class FaceTrackingNode(Node):
         self.camera_index = self.get_parameter('camera_index').get_parameter_value().integer_value
         
         # 얼굴 인식기 초기화
-        # cv2.data를 사용하지 않고 직접 경로 찾기 (더 안정적)
+        # cv2.data를 완전히 사용하지 않고 시스템/패키지 경로만 사용 (근본적 해결)
         import os
         
         # 가능한 경로 목록 (우선순위 순서)
-        possible_paths = []
-        
-        # 1. cv2.data를 안전하게 시도 (있으면 추가)
-        try:
-            if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
-                data_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-                if os.path.exists(data_path):
-                    possible_paths.append(data_path)
-        except:
-            pass  # cv2.data 접근 실패 시 무시
-        
-        # 2. 시스템 경로 추가
-        possible_paths.extend([
+        # cv2.data는 사용하지 않음 - 시스템 경로와 Python 패키지 경로만 사용
+        possible_paths = [
+            # 시스템 경로 (opencv-data 패키지 설치 시)
             '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
             '/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
             '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
             '/usr/local/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
-        ])
+        ]
         
-        # 3. Python 패키지 경로 추가
+        # Python 패키지 경로 (opencv-python 또는 opencv-contrib-python 설치 시)
         try:
             cv2_path = os.path.dirname(cv2.__file__)
             pkg_path = os.path.join(cv2_path, 'data', 'haarcascade_frontalface_default.xml')
-            if pkg_path not in possible_paths:
-                possible_paths.append(pkg_path)
+            possible_paths.append(pkg_path)
         except:
             pass
         
@@ -248,8 +237,10 @@ class FaceTrackingNode(Node):
         
         if cascade_path is None:
             raise RuntimeError(
-                'Haar Cascade 파일을 찾을 수 없습니다. '
-                '다음 명령으로 설치하세요: sudo apt install opencv-data'
+                'Haar Cascade 파일을 찾을 수 없습니다.\n'
+                '다음 중 하나를 실행하세요:\n'
+                '  1. sudo apt install -y opencv-data\n'
+                '  2. pip install opencv-python 또는 opencv-contrib-python'
             )
         
         self.face_cascade = cv2.CascadeClassifier(cascade_path)
