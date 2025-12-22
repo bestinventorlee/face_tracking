@@ -251,24 +251,119 @@ class FaceTrackingNode(Node):
             raise RuntimeError(f'Haar Cascade 파일을 로드할 수 없습니다: {cascade_path}')
         self.get_logger().info(f'얼굴 인식기 초기화 완료: {cascade_path}')
         
+        # 카메라 초기화
+        self._init_camera()
+    
+    def _find_available_cameras(self, max_test=10):
+        """
+        사용 가능한 카메라 인덱스를 찾습니다.
+        외부 USB 카메라를 우선적으로 선택합니다.
+        
+        Args:
+            max_test: 테스트할 최대 카메라 인덱스 수
+        
+        Returns:
+            (사용 가능한 카메라 인덱스 리스트, USB 카메라 인덱스 리스트)
+        """
+        import os
+        available = []
+        usb_cameras = []
+        
+        # 먼저 모든 사용 가능한 카메라 찾기
+        for idx in range(max_test):
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                # 실제로 프레임을 읽을 수 있는지 테스트
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    available.append(idx)
+                    # USB 카메라인지 확인 (/dev/video* 경로 확인)
+                    video_device = f'/dev/video{idx}'
+                    if os.path.exists(video_device):
+                        # USB 카메라인지 확인 (udevadm 또는 sysfs 사용)
+                        try:
+                            import subprocess
+                            result = subprocess.run(
+                                ['udevadm', 'info', '--query=property', '--name', video_device],
+                                capture_output=True, text=True, timeout=1
+                            )
+                            if result.returncode == 0:
+                                # USB 관련 속성이 있으면 USB 카메라로 간주
+                                if 'ID_USB' in result.stdout or 'ID_BUS=usb' in result.stdout:
+                                    usb_cameras.append(idx)
+                                    self.get_logger().debug(f'USB 카메라 {idx} 발견: {video_device}')
+                        except:
+                            # udevadm가 없거나 실패하면, 낮은 인덱스를 USB로 간주 (일반적으로 USB가 먼저 할당됨)
+                            if idx < 2:  # 0, 1은 보통 USB 카메라
+                                usb_cameras.append(idx)
+                    
+                    self.get_logger().debug(f'카메라 {idx} 발견: 해상도 {frame.shape[1]}x{frame.shape[0]}')
+                cap.release()
+            else:
+                cap.release()
+        
+        # USB 카메라가 없으면 낮은 인덱스를 우선 (일반적으로 USB가 낮은 인덱스 사용)
+        if not usb_cameras and len(available) > 0:
+            # 인덱스 0, 1을 USB로 간주 (일반적인 경우)
+            usb_cameras = [idx for idx in available if idx < 2]
+        
+        return available, usb_cameras
+    
+    def _init_camera(self):
+        """카메라 초기화 - 외부 USB 카메라를 우선적으로 선택"""
         # 트래킹 파라미터 (ROS2 파라미터에서 로드) - 카메라 인덱스를 먼저 읽기 위해
-        self.declare_parameter('camera_index', 0)  # 카메라 인덱스 (0 또는 1)
-        self.camera_index = self.get_parameter('camera_index').get_parameter_value().integer_value
+        self.declare_parameter('camera_index', -1)  # 카메라 인덱스 (-1: 자동, 0 이상: 특정 인덱스)
+        requested_index = self.get_parameter('camera_index').get_parameter_value().integer_value
+        
+        # 사용 가능한 카메라 찾기 (USB 카메라 우선)
+        available_cameras, usb_cameras = self._find_available_cameras()
+        self.get_logger().info(f'사용 가능한 카메라: {available_cameras}')
+        if usb_cameras:
+            self.get_logger().info(f'USB 카메라: {usb_cameras}')
         
         # 카메라 초기화
+        if requested_index == -1:
+            # 자동 선택: USB 카메라 우선, 없으면 첫 번째 사용 가능한 카메라
+            if usb_cameras:
+                self.camera_index = usb_cameras[0]
+                self.get_logger().info(f'자동으로 USB 카메라 {self.camera_index} 선택됨')
+            elif len(available_cameras) > 0:
+                self.camera_index = available_cameras[0]
+                self.get_logger().info(f'USB 카메라가 없어 첫 번째 사용 가능한 카메라 {self.camera_index} 선택됨')
+            else:
+                raise RuntimeError('사용 가능한 카메라를 찾을 수 없습니다!')
+        elif requested_index in available_cameras:
+            # 요청한 인덱스가 사용 가능한 경우
+            self.camera_index = requested_index
+            camera_type = "USB" if requested_index in usb_cameras else "내장"
+            self.get_logger().info(f'요청한 {camera_type} 카메라 {self.camera_index} 사용')
+        else:
+            # 요청한 인덱스가 사용 불가능한 경우, USB 카메라 우선으로 폴백
+            if usb_cameras:
+                self.camera_index = usb_cameras[0]
+                self.get_logger().warn(
+                    f'카메라 {requested_index}를 사용할 수 없습니다. '
+                    f'대신 USB 카메라 {self.camera_index}를 사용합니다.'
+                )
+            elif len(available_cameras) > 0:
+                self.camera_index = available_cameras[0]
+                self.get_logger().warn(
+                    f'카메라 {requested_index}를 사용할 수 없습니다. '
+                    f'대신 카메라 {self.camera_index}를 사용합니다.'
+                )
+            else:
+                raise RuntimeError(f'카메라 {requested_index}를 열 수 없고, 다른 카메라도 없습니다!')
+        
+        # 선택한 카메라로 초기화
         self.cap = cv2.VideoCapture(self.camera_index)
         if not self.cap.isOpened():
-            self.get_logger().error(f'카메라 {self.camera_index}를 열 수 없습니다!')
-            # 다른 카메라 시도 (0과 1 중 선택되지 않은 것)
-            fallback_index = 1 if self.camera_index == 0 else 0
-            self.get_logger().info(f'카메라 {fallback_index}로 재시도 중...')
-            self.cap = cv2.VideoCapture(fallback_index)
-            if not self.cap.isOpened():
-                self.get_logger().error('모든 카메라를 열 수 없습니다!')
-                raise RuntimeError('카메라 초기화 실패')
-            else:
-                self.camera_index = fallback_index
-                self.get_logger().warn(f'카메라 {fallback_index}를 사용합니다.')
+            raise RuntimeError(f'카메라 {self.camera_index} 초기화 실패!')
+        
+        # 카메라가 실제로 프레임을 제공하는지 테스트
+        ret, test_frame = self.cap.read()
+        if not ret or test_frame is None:
+            self.cap.release()
+            raise RuntimeError(f'카메라 {self.camera_index}에서 프레임을 읽을 수 없습니다!')
         
         # 카메라 해상도 설정 (HD 해상도)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
